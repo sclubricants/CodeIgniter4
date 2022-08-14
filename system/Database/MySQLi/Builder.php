@@ -57,16 +57,25 @@ class Builder extends BaseBuilder
     /**
      * Generates a platform-specific batch update string from the supplied data
      */
-    protected function _updateBatch(string $table, array $values, string $index): string
+    protected function _updateBatch(string $table, array $keys, array $values): string
     {
-        $keys = array_keys(current($values));
+        $constraints = $this->QBOptions['constraints'] ?? [];
 
-        // make array for future use with composite keys - `field`
-        // future: $this->QBOptions['constraints']
-        $constraints = [$index];
+        if ($constraints === []) {
+            if ($this->db->DBDebug) {
+                throw new DatabaseException('You must specify a constraint to match on for batch updates.');
+            }
 
-        // future: $this->QBOptions['updateFields']
-        $updateFields = array_filter($keys, static fn ($index) => ! in_array($index, $constraints, true));
+            return ''; // @codeCoverageIgnor
+        }
+
+        $updateFields = $this->QBOptions['updateFields'] ?? [];
+
+        if ($updateFields === []) {
+            $updateFields = array_filter($keys, static fn ($index) => ! in_array($index, $constraints, true));
+            
+            $this->QBOptions['updateFields'] = $updateFields;
+        }
 
         $sql = 'UPDATE ' . $this->compileIgnore('update') . $table . " AS t\n";
 

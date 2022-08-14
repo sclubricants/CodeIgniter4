@@ -1736,42 +1736,27 @@ class BaseBuilder
      *
      * @return false|int|string[] Number of rows inserted or FALSE on failure, SQL array when testMode
      */
-    protected function batchExecute(string $renderMethod, ?array $set = null, ?bool $escape = null, int $batchSize = 100)
+    protected function batchExecute(string $renderMethod, int $batchSize = 100)
     {
-        if ($set === null) {
-            if (empty($this->QBSet)) {
-                if ($this->db->DBDebug) {
-                    throw new DatabaseException('You must use the "set" method to update an entry.');
-                }
-
-                return false; // @codeCoverageIgnore
-            }
-        } elseif (empty($set)) {
+        if (empty($this->QBSet)) {
             if ($this->db->DBDebug) {
-                throw new DatabaseException('insertBatch()/upsertBatch called with no data');
+                throw new DatabaseException('No data availble to process.');
             }
 
             return false; // @codeCoverageIgnore
         }
-
-        $hasQBSet = $set === null;
 
         $table = $this->db->protectIdentifiers($this->QBFrom[0], true, null, false);
 
         $affectedRows = 0;
         $savedSQL     = [];
 
-        if ($hasQBSet) {
-            $set = $this->QBSet;
-        }
+        $set = $this->QBSet;
 
         for ($i = 0, $total = count($set); $i < $total; $i += $batchSize) {
-            if ($hasQBSet) {
-                $QBSet = array_slice($this->QBSet, $i, $batchSize);
-            } else {
-                $this->setBatch(array_slice($set, $i, $batchSize), $escape);
-                $QBSet = $this->QBSet;
-            }
+
+            $QBSet = array_slice($this->QBSet, $i, $batchSize);
+
             $sql = $this->{$renderMethod}($table, $this->QBKeys, $QBSet);
 
             if ($sql === '') {
@@ -1784,13 +1769,6 @@ class BaseBuilder
                 $this->db->query($sql, null, false);
                 $affectedRows += $this->db->affectedRows();
             }
-
-            if (! $hasQBSet) {
-                $this->resetRun([
-                    'QBSet'  => [],
-                    'QBKeys' => [],
-                ]);
-            }
         }
 
         $this->resetWrite();
@@ -1799,7 +1777,7 @@ class BaseBuilder
     }
 
     /**
-     * Allows key/value pairs to be set for batch inserts/upserts
+     * Allows key/value pairs to be set for batch inserts/upserts/updates
      *
      * @param array|object $set
      *
@@ -1807,6 +1785,14 @@ class BaseBuilder
      */
     public function setBatch($set, ?bool $escape = null)
     {
+        if (empty($set)) {
+            if ($this->db->DBDebug) {
+                throw new DatabaseException('setBatch() has no data.');
+            }
+
+            return null; // @codeCoverageIgnore
+        }
+
         $set = $this->batchObjectToArray($set);
 
         $escape = is_bool($escape) ? $escape : $this->db->protectIdentifiers;
@@ -1887,7 +1873,9 @@ class BaseBuilder
             $set = [$set];
         }
 
-        return $this->batchExecute('_upsertBatch', $set, $escape, 1);
+        $this->setBatch($set, $escape);
+
+        return $this->batchExecute('_upsertBatch', 1);
     }
 
     /**
@@ -1899,7 +1887,11 @@ class BaseBuilder
      */
     public function upsertBatch(?array $set = null, ?bool $escape = null, int $batchSize = 100)
     {
-        return $this->batchExecute('_upsertBatch', $set, $escape, $batchSize);
+        if ($set !== null) {
+            $this->setBatch($set, $escape);
+        }
+
+        return $this->batchExecute('_upsertBatch', $batchSize);
     }
 
     /**
@@ -1927,7 +1919,7 @@ class BaseBuilder
     }
 
     /**
-     * Sets constraints for upsert
+     * Sets constraints for upsert, update
      *
      * @param string|string[] $keys
      *
@@ -1935,17 +1927,19 @@ class BaseBuilder
      */
     public function onConstraint($keys)
     {
-        if (! is_array($keys)) {
-            $keys = explode(',', $keys);
-        }
+        if (! empty($keys)) {
+            if (! is_array($keys)) {
+                $keys = explode(',', $keys);
+            }
 
-        $this->QBOptions['constraints'] = array_map(static fn ($key) => trim($key), $keys);
+            $this->QBOptions['constraints'] = $this->db->protectIdentifiers(array_map(static fn ($key) => trim($key), $keys));
+        }
 
         return $this;
     }
 
     /**
-     * Sets update fields for upsert
+     * Sets update fields for upsert, update
      *
      * @param string|string[] $keys
      *
@@ -1953,11 +1947,13 @@ class BaseBuilder
      */
     public function updateFields($keys)
     {
-        if (! is_array($keys)) {
-            $keys = explode(',', $keys);
-        }
+        if (! empty($keys)) {
+            if (! is_array($keys)) {
+                $keys = explode(',', $keys);
+            }
 
-        $this->QBOptions['updateFields'] = array_map(static fn ($key) => trim($key), $keys);
+            $this->QBOptions['updateFields'] = $this->db->protectIdentifiers(array_map(static fn ($key) => trim($key), $keys));
+        }
 
         return $this;
     }
@@ -1979,7 +1975,11 @@ class BaseBuilder
      */
     public function insertBatch(?array $set = null, ?bool $escape = null, int $batchSize = 100)
     {
-        return $this->batchExecute('_insertBatch', $set, $escape, $batchSize);
+        if ($set !== null) {
+            $this->setBatch($set, $escape);
+        }
+
+        return $this->batchExecute('_insertBatch', $batchSize);
     }
 
     /**
@@ -2288,11 +2288,31 @@ class BaseBuilder
     /**
      * Compiles an update string and runs the query
      *
+     * @param array|string|null $constraint
+     *
      * @throws DatabaseException
      *
      * @return false|int|string[] Number of rows affected or FALSE on failure, SQL array when testMode
      */
-    public function updateBatch(?array $set = null, ?string $index = null, int $batchSize = 100)
+    public function updateBatch(?array $set = null, $constraint = null, int $batchSize = 100)
+    {
+        if ($set !== null) {
+            $this->setBatch($set, true);
+        }
+
+        $this->onConstraint($constraint);
+
+        $this->batchExecute('_updateBatch', $batchSize);
+    }
+
+    /**
+     * Compiles an update string and runs the query
+     *
+     * @throws DatabaseException
+     *
+     * @return false|int|string[] Number of rows affected or FALSE on failure, SQL array when testMode
+     */
+    public function updateBatchOld(?array $set = null, ?string $index = null, int $batchSize = 100)
     {
         if ($index === null) {
             if ($this->db->DBDebug) {
@@ -2366,13 +2386,13 @@ class BaseBuilder
     /**
      * Generates a platform-specific batch update string from the supplied data
      */
-    protected function _updateBatch(string $table, array $values, string $index): string
+    protected function _updateBatch(string $table, array $values, array $constraint): string
     {
         $keys = array_keys(current($values));
 
         // make array for future use with composite keys - `field`
         // future: $this->QBOptions['constraints']
-        $constraints = [$index];
+        $constraints = $constraint;
 
         // future: $this->QBOptions['updateFields']
         $updateFields = array_filter($keys, static fn ($index) => ! in_array($index, $constraints, true));
