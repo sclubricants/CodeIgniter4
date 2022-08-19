@@ -2039,7 +2039,7 @@ class BaseBuilder
                 }
             }
 
-            if ($addToDefault === false && isset($this->QBOptions['updateFieldsAdditional']) && isset($this->QBOptions['updateFields'])) {
+            if ($addToDefault === false && isset($this->QBOptions['updateFieldsAdditional'], $this->QBOptions['updateFields'])) {
                 $this->QBOptions['updateFields'] = array_merge($this->QBOptions['updateFields'], $this->QBOptions['updateFieldsAdditional']);
 
                 unset($this->QBOptions['updateFieldsAdditional']);
