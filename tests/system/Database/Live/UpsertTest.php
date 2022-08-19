@@ -151,7 +151,7 @@ final class UpsertTest extends CIUnitTestCase
 
         // MySQL doesn't require a named constraint
         if ($this->db->DBDriver === 'MySQLi') {
-            $this->assertTrue(true);
+            $this->markTestSkipped('MySql is not compatible with this test.');
         } else {
             $this->expectException(DatabaseException::class);
             $this->expectExceptionMessage('No constraint found for upsert.');
@@ -170,9 +170,9 @@ final class UpsertTest extends CIUnitTestCase
                     INSERT INTO `db_user` (`country`, `email`, `name`)
                     VALUES ('Iran','ahmadinejad@world.com','Ahmadinejad')
                     ON DUPLICATE KEY UPDATE
-                    `country` = VALUES(`country`),
-                    `email` = VALUES(`email`),
-                    `name` = VALUES(`name`)
+                    `db_user`.`country` = VALUES(`country`),
+                    `db_user`.`email` = VALUES(`email`),
+                    `db_user`.`name` = VALUES(`name`)
                     SQL;
                 break;
 
@@ -183,7 +183,6 @@ final class UpsertTest extends CIUnitTestCase
                     ON CONFLICT("email")
                     DO UPDATE SET
                     "country" = "excluded"."country",
-                    "email" = "excluded"."email",
                     "name" = "excluded"."name"
                     SQL;
                 break;
@@ -195,7 +194,6 @@ final class UpsertTest extends CIUnitTestCase
                     ON CONFLICT(`email`)
                     DO UPDATE SET
                     `country` = `excluded`.`country`,
-                    `email` = `excluded`.`email`,
                     `name` = `excluded`.`name`
                     SQL;
                 break;
@@ -204,9 +202,9 @@ final class UpsertTest extends CIUnitTestCase
                 $expected = <<<'SQL'
                     MERGE INTO "test"."dbo"."db_user"
                     USING (
-                     VALUES ('Iran','ahmadinejad@world.com','Ahmadinejad')
+                    VALUES ('Iran','ahmadinejad@world.com','Ahmadinejad')
                     ) "_upsert" ("country", "email", "name")
-                    ON ( 1 != 1 OR ("test"."dbo"."db_user"."email" = "_upsert"."email"))
+                    ON ("test"."dbo"."db_user"."email" = "_upsert"."email")
                     WHEN MATCHED THEN UPDATE SET
                     "country" = "_upsert"."country",
                     "name" = "_upsert"."name"
@@ -221,7 +219,7 @@ final class UpsertTest extends CIUnitTestCase
                     USING (
                     SELECT 'Iran' "country", 'ahmadinejad@world.com' "email", 'Ahmadinejad' "name" FROM DUAL
                     ) "_upsert"
-                    ON ( 1 != 1 OR ("db_user"."email" = "_upsert"."email"))
+                    ON ("db_user"."email" = "_upsert"."email")
                     WHEN MATCHED THEN UPDATE SET
                     "country" = "_upsert"."country",
                     "name" = "_upsert"."name"
@@ -480,5 +478,41 @@ final class UpsertTest extends CIUnitTestCase
         $this->assertSame('Null One', $row1->name);
         $this->assertSame('Null Two', $row2->name);
         $this->assertSame('Null Three', $row3->name);
+    }
+
+    public function testUpsertBatchMultipleConstraints()
+    {
+        $data = [
+            [
+                'id'      => 1,
+                'email'   => 'derek@world.com',
+                'name'    => 'Derek Jones',
+                'country' => 'Greece',
+            ],
+            [
+                'id'      => 2,
+                'email'   => 'ahmadinejad@world.com',
+                'name'    => 'Ahmadinejad2',
+                'country' => 'Greece',
+            ],
+            [
+                'id'      => 3,
+                'name'    => 'Richard A Causey',
+                'email'   => 'richard@world.com',
+                'country' => 'Greece',
+            ],
+        ];
+
+        if ($this->db->DBDriver === 'SQLite3') {
+            $this->markTestSkipped('SQLite3 is not compatible with this test.');
+        } elseif ($this->db->DBDriver === 'Postgre') {
+            $this->markTestSkipped('Postgre is not compatible with this test.');
+        } else {
+            $this->db->table('user')->onConstraint('id, email')->upsertBatch($data);
+
+            $this->seeInDatabase('user', ['id' => 1, 'country' => 'Greece']);
+            $this->seeInDatabase('user', ['id' => 2, 'country' => 'Greece']);
+            $this->seeInDatabase('user', ['id' => 3, 'country' => 'Greece']);
+        }
     }
 }

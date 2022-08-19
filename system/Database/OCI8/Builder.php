@@ -13,6 +13,7 @@ namespace CodeIgniter\Database\OCI8;
 
 use CodeIgniter\Database\BaseBuilder;
 use CodeIgniter\Database\Exceptions\DatabaseException;
+use CodeIgniter\Database\RawSql;
 
 /**
  * Builder for OCI8
@@ -67,31 +68,36 @@ class Builder extends BaseBuilder
      */
     protected function _insertBatch(string $table, array $keys, array $values): string
     {
-        $values = $this->getValues($values);
+        $sql = $this->QBOptions['sql'] ?? ''; // @phpstan-ignore-line
 
-        $insertKeys    = implode(', ', $keys);
-        $hasPrimaryKey = in_array('PRIMARY', array_column($this->db->getIndexData($table), 'type'), true);
+        // if this is the first iteration of batch then we need to build skeleton sql
+        if ($sql === '') {
+            $insertKeys    = implode(', ', $keys);
+            $hasPrimaryKey = in_array('PRIMARY', array_column($this->db->getIndexData($table), 'type'), true);
 
-        // ORA-00001 measures
-        if ($hasPrimaryKey) {
-            $sql               = 'INSERT INTO ' . $table . ' (' . $insertKeys . ") \n SELECT * FROM (\n";
-            $selectQueryValues = [];
+            // ORA-00001 measures
+            $sql = 'INSERT' . ($hasPrimaryKey ? '' : ' ALL') . ' INTO ' . $table . ' (' . $insertKeys . ")\n%s";
 
-            foreach ($values as $value) {
-                $selectValues        = implode(',', array_map(static fn ($value, $key) => $value . ' as ' . $key, explode(',', substr(substr($value, 1), 0, -1)), $keys));
-                $selectQueryValues[] = 'SELECT ' . $selectValues . ' FROM DUAL';
-            }
-
-            return $sql . implode("\n UNION ALL \n", $selectQueryValues) . "\n)";
+            $this->QBOptions['sql'] = $sql;
         }
 
-        $sql = "INSERT ALL\n";
-
-        foreach ($values as $value) {
-            $sql .= '	INTO ' . $table . ' (' . $insertKeys . ') VALUES ' . $value . "\n";
+        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+            $data = $this->QBOptions['fromQuery'];
+        } else {
+            $data = implode(
+                " FROM DUAL UNION ALL\n",
+                array_map(
+                    static fn ($value) => 'SELECT ' . implode(', ', array_map(
+                        static fn ($key, $index) => $index . ' ' . $key,
+                        $keys,
+                        $value
+                    )),
+                    $values
+                )
+            ) . " FROM DUAL\n";
         }
 
-        return $sql . 'SELECT * FROM DUAL';
+        return sprintf($sql, $data);
     }
 
     /**
@@ -101,84 +107,102 @@ class Builder extends BaseBuilder
      */
     protected function _upsertBatch(string $table, array $keys, array $values): string
     {
-        $fieldNames = array_map(static fn ($columnName) => trim($columnName, '"'), $keys);
+        $sql = $this->QBOptions['sql'] ?? ''; // @phpstan-ignore-line
 
-        $constraints = $this->QBOptions['constraints'] ?? [];
+        // if this is the first iteration of batch then we need to build skeleton sql
+        if ($sql === '') {
+            $constraints = $this->QBOptions['constraints'] ?? [];
 
-        $updateFields = $this->QBOptions['updateFields'] ?? [];
+            if (empty($constraints)) {
+                $fieldNames = array_map(static fn ($columnName) => trim($columnName, '"'), $keys);
 
-        if (empty($constraints)) {
-            $uniqueIndexes = array_filter($this->db->getIndexData($table), static function ($index) use ($fieldNames) {
-                $hasAllFields = count(array_intersect($index->fields, $fieldNames)) === count($index->fields);
+                $uniqueIndexes = array_filter($this->db->getIndexData($table), static function ($index) use ($fieldNames) {
+                    $hasAllFields = count(array_intersect($index->fields, $fieldNames)) === count($index->fields);
 
-                return ($index->type === 'PRIMARY' || $index->type === 'UNIQUE') && $hasAllFields;
-            });
+                    return ($index->type === 'PRIMARY' || $index->type === 'UNIQUE') && $hasAllFields;
+                });
 
-            // only take first index
-            foreach ($uniqueIndexes as $index) {
-                $constraints = $index->fields;
-                break;
+                // only take first index
+                foreach ($uniqueIndexes as $index) {
+                    $constraints = $index->fields;
+                    break;
+                }
+
+                $constraints = $this->onConstraint($constraints)->QBOptions['constraints'] ?? [];
             }
 
-            $this->QBOptions['constraints'] = $constraints;
-        }
+            if (empty($constraints)) {
+                if ($this->db->DBDebug) {
+                    throw new DatabaseException('No constraint found for upsert.');
+                }
 
-        if (empty($updateFields)) {
-            $updateFields = array_filter(
-                $fieldNames,
-                static fn ($columnName) => ! (in_array($columnName, $constraints, true))
+                return ''; // @codeCoverageIgnore
+            }
+
+            $updateFields = $this->QBOptions['updateFields'] ?? $this->updateFields($keys, false, $constraints)->QBOptions['updateFields'] ?? [];
+
+            if (empty($updateFields)) {
+                $updateFields = array_filter(
+                    $keys,
+                    static fn ($columnName) => ! (in_array($columnName, $constraints, true))
+                );
+
+                $this->QBOptions['updateFields'] = $updateFields;
+            }
+
+            $sql = 'MERGE INTO ' . $table . "\nUSING (\n%s";
+
+            $sql .= ') "_upsert"' . "\nON (";
+
+            $sql .= implode(
+                ' AND ',
+                array_map(
+                    static fn ($key) => ($key instanceof RawSql ?
+                        $key :
+                        $table . '.' . $key . ' = ' . '"_upsert".' . $key),
+                    $constraints
+                )
+            ) . ")\n";
+
+            $sql .= "WHEN MATCHED THEN UPDATE SET\n";
+
+            $sql .= implode(
+                ",\n",
+                array_map(
+                    static fn ($key, $value) => $key . ($value instanceof RawSql ?
+                        ' = ' . $value :
+                        ' = ' . '"_upsert".' . $value),
+                    array_keys($updateFields),
+                    $updateFields
+                )
             );
 
-            $this->QBOptions['updateFields'] = $updateFields;
+            $sql .= "\nWHEN NOT MATCHED THEN INSERT (" . implode(', ', $keys) . ")\nVALUES ";
+
+            $sql .= (' ('
+                . implode(', ', array_map(static fn ($columnName) => '"_upsert".' . $columnName, $keys))
+                . ')');
+
+            $this->QBOptions['sql'] = $sql;
         }
 
-        if (empty($constraints)) {
-            if ($this->db->DBDebug) {
-                throw new DatabaseException('No constraint found for upsert.');
-            }
-
-            return ''; // @codeCoverageIgnore
+        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+            $data = $this->QBOptions['fromQuery'];
+        } else {
+            $data = implode(
+                " FROM DUAL UNION ALL\n",
+                array_map(
+                    static fn ($value) => 'SELECT ' . implode(', ', array_map(
+                        static fn ($key, $index) => $index . ' ' . $key,
+                        $keys,
+                        $value
+                    )),
+                    $values
+                )
+            ) . " FROM DUAL\n";
         }
 
-        $sql = 'MERGE INTO ' . $table . "\nUSING (\n";
-
-        foreach ($values as $value) {
-            $sql .= 'SELECT ';
-            $sql .= implode(', ', array_map(
-                static fn ($columnName, $value) => $value . ' ' . $columnName,
-                $keys,
-                $value
-            ));
-            $sql .= " FROM DUAL UNION ALL\n";
-        }
-
-        $sql = substr($sql, 0, -11) . "\n";
-
-        $sql .= ') "_upsert"' . "\nON ( ";
-
-        $onList   = [];
-        $onList[] = '1 != 1';
-
-        $onList[] = '(' . implode(
-            ' AND ',
-            array_map(
-                static fn ($columnName) => $table . '."' . $columnName . '" = "_upsert"."' . $columnName . '"',
-                $constraints
-            )
-        ) . ')';
-
-        $sql .= implode(' OR ', $onList) . ")\nWHEN MATCHED THEN UPDATE SET\n";
-
-        $sql .= implode(",\n", array_map(
-            static fn ($columnName) => '"' . $columnName . '"' . ' = "_upsert"."' . $columnName . '"',
-            $updateFields
-        ));
-
-        $sql .= "\nWHEN NOT MATCHED THEN INSERT (" . implode(', ', $keys) . ")\nVALUES ";
-
-        return $sql . (' ('
-            . implode(', ', array_map(static fn ($columnName) => '"_upsert".' . $columnName, $keys))
-            . ')');
+        return sprintf($sql, $data);
     }
 
     /**
@@ -320,48 +344,79 @@ class Builder extends BaseBuilder
     /**
      * Generates a platform-specific batch update string from the supplied data
      */
-    protected function _updateBatch(string $table, array $values, string $index): string
+    protected function _updateBatch(string $table, array $keys, array $values): string
     {
-        $keys = array_keys(current($values));
+        $sql = $this->QBOptions['sql'] ?? ''; // @phpstan-ignore-line
 
-        // make array for future use with composite keys - `field`
-        // future: $this->QBOptions['constraints']
-        $constraints = [$index];
+        // if this is the first iteration of batch then we need to build skeleton sql
+        if ($sql === '') {
+            $constraints = $this->QBOptions['constraints'] ?? [];
 
-        // future: $this->QBOptions['updateFields']
-        $updateFields = array_filter($keys, static fn ($index) => ! in_array($index, $constraints, true));
+            if ($constraints === []) {
+                if ($this->db->DBDebug) {
+                    throw new DatabaseException('You must specify a constraint to match on for batch updates.');
+                }
 
-        // Oracle doesn't support ignore on updates so we will use MERGE
-        $sql = 'MERGE INTO ' . $table . " \"t\"\n";
+                return ''; // @codeCoverageIgnor
+            }
 
-        $sql .= 'USING (' . "\n";
+            $updateFields = $this->QBOptions['updateFields'] ??
+                $this->updateFields($keys, false, $constraints)->QBOptions['updateFields'] ??
+                [];
 
-        $sql .= implode(
-            " UNION ALL\n",
-            array_map(
-                static fn ($value) => 'SELECT ' . implode(', ', array_map(
-                    static fn ($key, $index) => $index . ' ' . $key,
-                    $keys,
-                    $value
-                )) . ' FROM DUAL',
-                $values
-            )
-        ) . "\n";
+            $alias = $this->QBOptions['alias'] ?? '"_u"'; // @phpstan-ignore-line
 
-        $sql .= ') "u"' . "\n";
+            // Oracle doesn't support ignore on updates so we will use MERGE
+            $sql = 'MERGE INTO ' . $table . "\n";
 
-        $sql .= 'ON (' . implode(
-            ' AND ',
-            array_map(static fn ($key) => '"t".' . $key . ' = "u".' . $key, $constraints)
-        ) . ")\n";
+            $sql .= 'USING (' . "\n%s";
 
-        $sql .= "WHEN MATCHED THEN UPDATE\n";
+            $sql .= ') ' . $alias . "\n";
 
-        $sql .= 'SET' . "\n";
+            $sql .= 'ON (' . implode(
+                ' AND ',
+                array_map(
+                    static fn ($key) => ($key instanceof RawSql ?
+                    $key :
+                    $table . '.' . $key . ' = ' . $alias . '.' . $key),
+                    $constraints
+                )
+            ) . ")\n";
 
-        return $sql .= implode(
-            ",\n",
-            array_map(static fn ($key) => '"t".' . $key . ' = "u".' . $key, $updateFields)
-        );
+            $sql .= "WHEN MATCHED THEN UPDATE\n";
+
+            $sql .= 'SET' . "\n";
+
+            $sql .= implode(
+                ",\n",
+                array_map(
+                    static fn ($key, $value) => $table . '.' . $key . ($value instanceof RawSql ?
+                    ' = ' . $value :
+                    ' = ' . $alias . '.' . $value),
+                    array_keys($updateFields),
+                    $updateFields
+                )
+            );
+
+            $this->QBOptions['sql'] = $sql;
+        }
+
+        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+            $data = $this->QBOptions['fromQuery'];
+        } else {
+            $data = implode(
+                " UNION ALL\n",
+                array_map(
+                    static fn ($value) => 'SELECT ' . implode(', ', array_map(
+                        static fn ($key, $index) => $index . ' ' . $key,
+                        $keys,
+                        $value
+                    )) . ' FROM DUAL',
+                    $values
+                )
+            ) . "\n";
+        }
+
+        return sprintf($sql, $data);
     }
 }

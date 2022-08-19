@@ -196,13 +196,24 @@ class Builder extends BaseBuilder
      */
     protected function _insertBatch(string $table, array $keys, array $values): string
     {
-        return trim(sprintf(
-            'INSERT INTO %s (%s) VALUES %s %s',
-            $table,
-            implode(', ', $keys),
-            implode(', ', $this->getValues($values)),
-            $this->compileIgnore('insert')
-        ));
+        $sql = $this->QBOptions['sql'] ?? ''; // @phpstan-ignore-line
+
+        // if this is the first iteration of batch then we need to build skeleton sql
+        if ($sql === '') {
+            $sql = 'INSERT INTO ' . $table . '(' . implode(', ', $keys) . ")\n%s\n";
+
+            $sql .= $this->compileIgnore('insert');
+
+            $this->QBOptions['sql'] = $sql;
+        }
+
+        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+            $data = $this->QBOptions['fromQuery'];
+        } else {
+            $data = 'VALUES ' . implode(', ', $this->getValues($values));
+        }
+
+        return sprintf($sql, $data);
     }
 
     /**
@@ -212,71 +223,88 @@ class Builder extends BaseBuilder
      */
     protected function _upsertBatch(string $table, array $keys, array $values): string
     {
-        $fieldNames = array_map(static fn ($columnName) => trim($columnName, '"'), $keys);
+        $sql = $this->QBOptions['sql'] ?? ''; // @phpstan-ignore-line
 
-        $constraints = $this->QBOptions['constraints'] ?? [];
+        // if this is the first iteration of batch then we need to build skeleton sql
+        if ($sql === '') {
+            $fieldNames = array_map(static fn ($columnName) => trim($columnName, '"'), $keys);
 
-        $updateFields = $this->QBOptions['updateFields'] ?? $fieldNames;
+            $constraints = $this->QBOptions['constraints'] ?? [];
 
-        if (empty($constraints)) {
-            $allIndexes = array_filter($this->db->getIndexData($table), static function ($index) use ($fieldNames) {
-                $hasAllFields = count(array_intersect($index->fields, $fieldNames)) === count($index->fields);
+            if (empty($constraints)) {
+                $allIndexes = array_filter($this->db->getIndexData($table), static function ($index) use ($fieldNames) {
+                    $hasAllFields = count(array_intersect($index->fields, $fieldNames)) === count($index->fields);
 
-                return ($index->type === 'UNIQUE' || $index->type === 'PRIMARY') && $hasAllFields;
-            });
+                    return ($index->type === 'UNIQUE' || $index->type === 'PRIMARY') && $hasAllFields;
+                });
 
-            foreach (array_map(static fn ($index) => $index->fields, $allIndexes) as $index) {
-                foreach ($index as $constraint) {
-                    $constraints[] = $constraint;
+                foreach (array_map(static fn ($index) => $index->fields, $allIndexes) as $index) {
+                    $constraints[] = current($index);
+                    // only one index can be used?
+                    break;
                 }
-                // only one index can be used?
-                break;
+
+                $constraints = $this->onConstraint($constraints)->QBOptions['constraints'] ?? [];
             }
 
-            $this->QBOptions['constraints'] = $constraints;
-        }
+            if (empty($constraints)) {
+                if ($this->db->DBDebug) {
+                    throw new DatabaseException('No constraint found for upsert.');
+                }
 
-        // in value set - replace null with DEFAULT where constraint is presumed not null
-        // autoincrement identity field must use DEFAULT and not NULL
-        foreach ($constraints as $constraint) {
-            $key = array_search($constraint, $fieldNames, true);
+                return ''; // @codeCoverageIgnore
+            }
 
-            if ($key !== false) {
-                foreach ($values as $arrayKey => $value) {
-                    if (strtoupper($value[$key]) === 'NULL') {
-                        $values[$arrayKey][$key] = 'DEFAULT';
+            // in value set - replace null with DEFAULT where constraint is presumed not null
+            // autoincrement identity field must use DEFAULT and not NULL
+            // this could be removed in favour of leaving to developer but does make things easier and function like other DBMS
+            foreach ($constraints as $constraint) {
+                $key = array_search(trim($constraint, '"'), $fieldNames, true);
+
+                if ($key !== false) {
+                    foreach ($values as $arrayKey => $value) {
+                        if (strtoupper($value[$key]) === 'NULL') {
+                            $values[$arrayKey][$key] = 'DEFAULT';
+                        }
                     }
                 }
             }
+
+            $updateFields = $this->QBOptions['updateFields'] ?? $this->updateFields($keys, false, $constraints)->QBOptions['updateFields'] ?? [];
+
+            $sql = 'INSERT INTO ' . $table . ' (';
+
+            $sql .= implode(', ', $keys);
+
+            $sql .= ")\n";
+
+            $sql .= '%s';
+
+            $sql .= 'ON CONFLICT(' . implode(',', $constraints) . ")\n";
+
+            $sql .= "DO UPDATE SET\n";
+
+            $sql .= implode(
+                ",\n",
+                array_map(
+                    static fn ($key, $value) => $key . ($value instanceof RawSql ?
+                        ' = ' . $value :
+                        ' = ' . '"excluded".' . $value),
+                    array_keys($updateFields),
+                    $updateFields
+                )
+            );
+
+            $this->QBOptions['sql'] = $sql;
         }
 
-        if (empty($constraints)) {
-            if ($this->db->DBDebug) {
-                throw new DatabaseException('No constraint found for upsert.');
-            }
-
-            return ''; // @codeCoverageIgnore
+        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+            $data = $this->QBOptions['fromQuery'];
+        } else {
+            $data = 'VALUES ' . implode(', ', $this->getValues($values)) . "\n";
         }
 
-        $sql = 'INSERT INTO ' . $table . ' (';
-
-        $sql .= implode(', ', array_map(static fn ($columnName) => $columnName, $keys));
-
-        $sql .= ")\n";
-
-        $sql .= 'VALUES ' . implode(', ', $this->getValues($values)) . "\n";
-
-        $sql .= 'ON CONFLICT("' . implode('","', $constraints) . "\")\n";
-
-        $sql .= "DO UPDATE SET\n";
-
-        return $sql . implode(
-            ",\n",
-            array_map(
-                static fn ($updateField) => '"' . $updateField . '" = "excluded"."' . $updateField . '"',
-                $updateFields
-            )
-        );
+        return sprintf($sql, $data);
     }
 
     /**

@@ -180,8 +180,23 @@ class Builder extends BaseBuilder
      */
     protected function _insertBatch(string $table, array $keys, array $values): string
     {
-        return 'INSERT ' . $this->compileIgnore('insert') . 'INTO ' . $this->getFullName($table)
-            . ' (' . implode(', ', $keys) . ') VALUES ' . implode(', ', $this->getValues($values));
+        $sql = $this->QBOptions['sql'] ?? ''; // @phpstan-ignore-line
+
+        // if this is the first iteration of batch then we need to build skeleton sql
+        if ($sql === '') {
+            $sql = 'INSERT ' . $this->compileIgnore('insert') . 'INTO ' . $this->getFullName($table)
+                . ' (' . implode(', ', $keys) . ")\n%s";
+
+            $this->QBOptions['sql'] = $sql;
+        }
+
+        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+            $data = $this->QBOptions['fromQuery'];
+        } else {
+            $data = 'VALUES ' . implode(', ', $this->getValues($values));
+        }
+
+        return sprintf($sql, $data);
     }
 
     /**
@@ -191,125 +206,145 @@ class Builder extends BaseBuilder
      */
     protected function _upsertBatch(string $table, array $keys, array $values): string
     {
-        $fullTableName = $this->getFullName($table);
+        $sql = $this->QBOptions['sql'] ?? ''; // @phpstan-ignore-line
 
-        $constraints = $this->QBOptions['constraints'] ?? [];
+        // if this is the first iteration of batch then we need to build skeleton sql
+        if ($sql === '') {
+            $fullTableName = $this->getFullName($table);
 
-        $updateFields = $this->QBOptions['updateFields'] ?? [];
+            $constraints = $this->QBOptions['constraints'] ?? [];
 
-        $tableIdentity = $this->QBOptions['tableIdentity'] ?? [];
+            $tableIdentity = $this->QBOptions['tableIdentity'] ?? [];
 
-        if (empty($tableIdentity)) {
-            $sql = "SELECT name from syscolumns where id = Object_ID('" . $table . "') and colstat = 1";
+            if (empty($tableIdentity)) {
+                $sql = "SELECT name from syscolumns where id = Object_ID('" . $table . "') and colstat = 1";
 
-            if (($query = $this->db->query($sql)) === false) {
-                throw new DatabaseException('Failed to get table identity'); // @codeCoverageIgnore
+                if (($query = $this->db->query($sql)) === false) {
+                    throw new DatabaseException('Failed to get table identity'); // @codeCoverageIgnore
+                }
+
+                $query = $query->getResultObject();
+
+                foreach ($query as $row) {
+                    $tableIdentity = '"' . $row->name . '"';
+                }
+
+                $this->QBOptions['tableIdentity'] = $tableIdentity;
             }
 
-            $query = $query->getResultObject();
+            $identityInFields = in_array($tableIdentity, $keys, true);
 
-            foreach ($query as $row) {
-                $tableIdentity = '"' . $row->name . '"';
-            }
+            $fieldNames = array_map(static fn ($columnName) => trim($columnName, '"'), $keys);
 
-            $this->QBOptions['tableIdentity'] = $tableIdentity;
-        }
+            if (empty($constraints)) {
+                $tableIndexes = $this->db->getIndexData($table);
 
-        $identityInFields = in_array($tableIdentity, $keys, true);
-
-        $fieldNames = array_map(static fn ($columnName) => trim($columnName, '"'), $keys);
-
-        if (empty($constraints)) {
-            $tableIndexes = $this->db->getIndexData($table);
-
-            $uniqueIndexes = array_filter($tableIndexes, static function ($index) use ($fieldNames) {
-                $hasAllFields = count(array_intersect($index->fields, $fieldNames)) === count($index->fields);
-
-                return $index->type === 'PRIMARY' && $hasAllFields;
-            });
-
-            // if no primary found then look for unique - since indexes have no order
-            if (empty($uniqueIndexes)) {
                 $uniqueIndexes = array_filter($tableIndexes, static function ($index) use ($fieldNames) {
                     $hasAllFields = count(array_intersect($index->fields, $fieldNames)) === count($index->fields);
 
-                    return $index->type === 'UNIQUE' && $hasAllFields;
+                    return $index->type === 'PRIMARY' && $hasAllFields;
                 });
+
+                // if no primary found then look for unique - since indexes have no order
+                if (empty($uniqueIndexes)) {
+                    $uniqueIndexes = array_filter($tableIndexes, static function ($index) use ($fieldNames) {
+                        $hasAllFields = count(array_intersect($index->fields, $fieldNames)) === count($index->fields);
+
+                        return $index->type === 'UNIQUE' && $hasAllFields;
+                    });
+                }
+
+                // only take first index
+                foreach ($uniqueIndexes as $index) {
+                    $constraints = $index->fields;
+                    break;
+                }
+
+                $constraints = $this->onConstraint($constraints)->QBOptions['constraints'] ?? [];
             }
 
-            // only take first index
-            foreach ($uniqueIndexes as $index) {
-                $constraints = $index->fields;
-                break;
+            if (empty($constraints)) {
+                if ($this->db->DBDebug) {
+                    throw new DatabaseException('No constraint found for upsert.');
+                }
+
+                return ''; // @codeCoverageIgnore
             }
 
-            $this->QBOptions['constraints'] = $constraints;
-        }
+            $updateFields = $this->QBOptions['updateFields'] ?? $this->updateFields($keys, false, $constraints)->QBOptions['updateFields'] ?? [];
 
-        if (empty($updateFields)) {
-            $updateFields = array_filter(
-                $fieldNames,
-                static fn ($columnName) => ! (in_array($columnName, $constraints, true))
+            if (empty($updateFields)) {
+                $updateFields = array_filter(
+                    $fieldNames,
+                    static fn ($columnName) => ! (in_array($columnName, $constraints, true))
+                );
+
+                $this->QBOptions['updateFields'] = $updateFields;
+            }
+
+            $sql = 'MERGE INTO ' . $fullTableName . "\nUSING (\n";
+
+            $sql .= '%s';
+
+            $sql .= ') "_upsert" (';
+
+            $sql .= implode(', ', $keys);
+
+            $sql .= ')';
+
+            $sql .= "\nON (";
+
+            $sql .= implode(
+                ' AND ',
+                array_map(
+                    static fn ($key) => ($key instanceof RawSql ?
+                        $key :
+                        $fullTableName . '.' . $key . ' = ' . '"_upsert".' . $key),
+                    $constraints
+                )
+            ) . ")\n";
+
+            $sql .= "WHEN MATCHED THEN UPDATE SET\n";
+
+            $sql .= implode(
+                ",\n",
+                array_map(
+                    static fn ($key, $value) => $key . ($value instanceof RawSql ?
+                        ' = ' . $value :
+                        ' = ' . '"_upsert".' . $value),
+                    array_keys($updateFields),
+                    $updateFields
+                )
             );
 
-            $this->QBOptions['updateFields'] = $updateFields;
+            $sql .= "\nWHEN NOT MATCHED THEN INSERT (" . implode(', ', $keys) . ")\nVALUES ";
+
+            $sql .= (
+                '(' . implode(
+                    ', ',
+                    array_map(
+                        static fn ($columnName) => $columnName === $tableIdentity
+                    ? 'CASE WHEN "_upsert".' . $columnName . ' IS NULL THEN (SELECT '
+                    . 'isnull(IDENT_CURRENT(\'' . $fullTableName . '\')+IDENT_INCR(\''
+                    . $fullTableName . '\'),1)) ELSE "_upsert".' . $columnName . ' END'
+                    : '"_upsert".' . $columnName,
+                        $keys
+                    )
+                ) . ');'
+            );
+
+            $sql = $identityInFields ? $this->addIdentity($fullTableName, $sql) : $sql;
+
+            $this->QBOptions['sql'] = $sql;
         }
 
-        if (empty($constraints)) {
-            if ($this->db->DBDebug) {
-                throw new DatabaseException('No constraint found for upsert.');
-            }
-
-            return ''; // @codeCoverageIgnore
+        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+            $data = $this->QBOptions['fromQuery'];
+        } else {
+            $data = 'VALUES ' . implode(', ', $this->getValues($values)) . "\n";
         }
 
-        $sql = 'MERGE INTO ' . $fullTableName . "\nUSING (\n VALUES ";
-
-        $sql .= implode(', ', $this->getValues($values)) . "\n";
-
-        $sql .= ') "_upsert" (';
-
-        $sql .= implode(', ', array_map(static fn ($columnName) => '"' . $columnName . '"', $fieldNames));
-
-        $sql .= ')';
-
-        $sql .= "\nON ( ";
-
-        $onList   = [];
-        $onList[] = '1 != 1';
-
-        $onList[] = '(' . implode(
-            ' AND ',
-            array_map(
-                static fn ($columnName) => $fullTableName . '."' . $columnName . '" = "_upsert"."' . $columnName . '"',
-                $constraints
-            )
-        ) . ')';
-
-        $sql .= implode(' OR ', $onList) . ")\nWHEN MATCHED THEN UPDATE SET\n";
-
-        $sql .= implode(",\n", array_map(
-            static fn ($columnName) => '"' . $columnName . '" = "_upsert"."' . $columnName . '"',
-            $updateFields
-        ));
-
-        $sql .= "\nWHEN NOT MATCHED THEN INSERT (" . implode(', ', $keys) . ")\nVALUES ";
-
-        $sql .= (
-            '(' . implode(
-                ', ',
-                array_map(
-                    static fn ($columnName) => $columnName === $tableIdentity
-                ? 'CASE WHEN "_upsert".' . $columnName . ' IS NULL THEN (SELECT '
-                . 'isnull(IDENT_CURRENT(\'' . $fullTableName . '\')+IDENT_INCR(\''
-                . $fullTableName . '\'),1)) ELSE "_upsert".' . $columnName . ' END'
-                : '"_upsert".' . $columnName,
-                    $keys
-                )
-            ) . ');'
-        );
-
-        return $identityInFields ? $this->addIdentity($fullTableName, $sql) : $sql;
+        return sprintf($sql, $data);
     }
 
     /**

@@ -1754,7 +1754,6 @@ class BaseBuilder
         $set = $this->QBSet;
 
         for ($i = 0, $total = count($set); $i < $total; $i += $batchSize) {
-
             $QBSet = array_slice($this->QBSet, $i, $batchSize);
 
             $sql = $this->{$renderMethod}($table, $this->QBKeys, $QBSet);
@@ -1780,10 +1779,11 @@ class BaseBuilder
      * Allows key/value pairs to be set for batch inserts/upserts/updates
      *
      * @param array|object $set
+     * @param string|null  $alias alias for sql table
      *
      * @return $this|null
      */
-    public function setBatch($set, ?bool $escape = null)
+    public function setBatch($set, ?bool $escape = null, ?string $alias = null)
     {
         if (empty($set)) {
             if ($this->db->DBDebug) {
@@ -1791,6 +1791,15 @@ class BaseBuilder
             }
 
             return null; // @codeCoverageIgnore
+        }
+
+        if ($alias !== null) {
+            $this->setAlias($alias);
+        }
+
+        // this allows to set just one row at a time
+        if (is_object($set) || (! is_array(current($set)) && ! is_object(current($set)))) {
+            $set = [$set];
         }
 
         $set = $this->batchObjectToArray($set);
@@ -1823,7 +1832,11 @@ class BaseBuilder
         }
 
         foreach ($keys as $k) {
-            $this->QBKeys[] = $this->db->protectIdentifiers($k, false);
+            $k = $this->db->protectIdentifiers($k, false);
+
+            if (! in_array($k, $this->QBKeys, true)) {
+                $this->QBKeys[] = $k;
+            }
         }
 
         return $this;
@@ -1881,12 +1894,30 @@ class BaseBuilder
     /**
      * Compiles batch upsert strings and runs the queries
      *
+     * @param array|BaseBuilder|object|string|null $set a dataset or select query
+     *
      * @throws DatabaseException
      *
      * @return false|int|string[] Number of affected rows or FALSE on failure, SQL array when testMode
      */
-    public function upsertBatch(?array $set = null, ?bool $escape = null, int $batchSize = 100)
+    public function upsertBatch($set = null, ?bool $escape = null, int $batchSize = 100)
     {
+        $this->fromQuery($set);
+
+        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+            $sql = $this->_upsertBatch($this->QBFrom[0], $this->QBKeys, []);
+
+            if ($sql === '') {
+                return false; // @codeCoverageIgnore
+            }
+
+            $this->db->query($sql, null, false);
+
+            $this->resetWrite();
+
+            return $this->testMode ? $sql : $this->db->affectedRows();
+        }
+
         if ($set !== null) {
             $this->setBatch($set, $escape);
         }
@@ -1899,40 +1930,68 @@ class BaseBuilder
      */
     protected function _upsertBatch(string $table, array $keys, array $values): string
     {
-        $fieldNames = array_map(static fn ($columnName) => trim($columnName, '`'), $keys);
+        $sql = $this->QBOptions['sql'] ?? ''; // @phpstan-ignore-line
 
-        $updateFields = $this->QBOptions['updateFields'] ?? $fieldNames;
+        // if this is the first iteration of batch then we need to build skeleton sql
+        if ($sql === '') {
+            $updateFields = $this->QBOptions['updateFields'] ?? $this->updateFields($keys)->QBOptions['updateFields'] ?? [];
 
-        $sql = 'INSERT INTO ' . $table . ' (' . implode(', ', $keys) . ')' . "\n";
+            $sql = 'INSERT INTO ' . $table . ' (' . implode(', ', $keys) . ')' . "\n";
 
-        $sql .= 'VALUES ' . implode(', ', $this->getValues($values)) . "\n";
+            $sql .= '%s';
 
-        $sql .= 'ON DUPLICATE KEY UPDATE' . "\n";
+            $sql .= 'ON DUPLICATE KEY UPDATE' . "\n";
 
-        return $sql . implode(
-            ",\n",
-            array_map(
-                static fn ($columnName) => '`' . $columnName . '` = VALUES(`' . $columnName . '`)',
-                $updateFields
-            )
-        );
+            $sql .= implode(
+                ",\n",
+                array_map(
+                    static fn ($key, $value) => $table . '.' . $key . ($value instanceof RawSql ?
+                        ' = ' . $value :
+                        ' = ' . 'VALUES(' . $value . ')'),
+                    array_keys($updateFields),
+                    $updateFields
+                )
+            );
+
+            $this->QBOptions['sql'] = $sql;
+        }
+
+        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+            $data = $this->QBOptions['fromQuery'];
+        } else {
+            $data = 'VALUES ' . implode(', ', $this->getValues($values)) . "\n";
+        }
+
+        return sprintf($sql, $data);
     }
 
     /**
      * Sets constraints for upsert, update
      *
-     * @param string|string[] $keys
+     * @param array|object|string $set a string of columns, key value pairs, or RawSql
      *
      * @return $this
      */
-    public function onConstraint($keys)
+    public function onConstraint($set)
     {
-        if (! empty($keys)) {
-            if (! is_array($keys)) {
-                $keys = explode(',', $keys);
+        if (! empty($set)) {
+            if (is_string($set)) {
+                $set = explode(',', $set);
+
+                $set = array_map(static fn ($key) => trim($key), $set);
             }
 
-            $this->QBOptions['constraints'] = $this->db->protectIdentifiers(array_map(static fn ($key) => trim($key), $keys));
+            if ($set instanceof RawSql) {
+                $set = [$set];
+            }
+
+            foreach ($set as $key => $value) {
+                if (! ($value instanceof RawSql)) {
+                    $value = $this->db->protectIdentifiers($value);
+                }
+
+                $this->QBOptions['constraints'][$key] = $value;
+            }
         }
 
         return $this;
@@ -1941,21 +2000,123 @@ class BaseBuilder
     /**
      * Sets update fields for upsert, update
      *
-     * @param string|string[] $keys
+     * @param string|string[] $set
+     * @param bool            $addToDefault adds update fields to the default ones
+     * @param array|null      $ignore       ignores items in set
      *
      * @return $this
      */
-    public function updateFields($keys)
+    public function updateFields($set, bool $addToDefault = false, ?array $ignore = null)
     {
-        if (! empty($keys)) {
-            if (! is_array($keys)) {
-                $keys = explode(',', $keys);
+        if (! empty($set)) {
+            if (! is_array($set)) {
+                $set = explode(',', $set);
             }
 
-            $this->QBOptions['updateFields'] = $this->db->protectIdentifiers(array_map(static fn ($key) => trim($key), $keys));
+            foreach ($set as $key => $value) {
+                if (! ($value instanceof RawSql)) {
+                    $value = $this->db->protectIdentifiers($value);
+                }
+
+                if (is_numeric($key)) {
+                    $key = $value;
+                }
+
+                if ($ignore === null || ! in_array($key, $ignore, true)) {
+                    if ($addToDefault) {
+                        $this->QBOptions['updateFieldsAdditional'][$this->db->protectIdentifiers($key)] = $value;
+                    } else {
+                        $this->QBOptions['updateFields'][$this->db->protectIdentifiers($key)] = $value;
+                    }
+                }
+            }
+
+            if ($addToDefault === false && isset($this->QBOptions['updateFieldsAdditional'])) { // @phpstan-ignore-line
+                $this->QBOptions['updateFields'] = array_merge($this->QBOptions['updateFields'], $this->QBOptions['updateFieldsAdditional'] ?? []); // @phpstan-ignore-line
+
+                unset($this->QBOptions['updateFieldsAdditional']);
+            }
         }
 
         return $this;
+    }
+
+    /**
+     * Set table alias for data in update/upsert
+     */
+    public function setAlias(string $alias): BaseBuilder
+    {
+        $this->QBOptions['alias'] = $this->db->protectIdentifiers($alias);
+
+        return $this;
+    }
+
+    /**
+     * Sets data source as a query for insert/update/upsert
+     *
+     * @param BaseBuilder|string $query
+     */
+    public function fromQuery($query): BaseBuilder
+    {
+        if (! empty($query)) {
+            if ($query instanceof BaseBuilder) {
+                $query = $query->getCompiledSelect();
+            }
+
+            if (is_string($query)) {
+                $this->QBOptions['fromQuery'] = $query;
+                $this->QBKeys                 = $this->db->protectIdentifiers($this->fieldsFromQuery($query));
+                $this->QBSet                  = [];
+            }
+        }
+
+        return $this;
+    }
+
+    /**
+     * Gets column names from a select query
+     *
+     * @param string $sql
+     */
+    protected function fieldsFromQuery($sql): array
+    {
+        // may need to search for delimiters needed before processing
+
+        $sql = preg_replace('/\\(([^()]*+|(?R))*\\)/', '', $sql); // remove everything in parenthesis - removes "FROM" and commas
+        $d   = ['`',  "'", '"'];
+
+        $o   = ' ';
+        $r   = '$';
+        $sql = preg_replace_callback("~{$d[0]}([^{$d[0]}]*){$d[0]}~", static fn ($s) => str_replace($o, $r, "{$d[0]}{$s[1]}{$d[0]}"), $sql);
+        $sql = preg_replace_callback("~{$d[1]}([^{$d[1]}]*){$d[1]}~", static fn ($s) => str_replace($o, $r, "{$d[1]}{$s[1]}{$d[1]}"), $sql);
+        $sql = preg_replace_callback("~{$d[2]}([^{$d[2]}]*){$d[2]}~", static fn ($s) => str_replace($o, $r, "{$d[2]}{$s[1]}{$d[2]}"), $sql);
+
+        $o   = ',';
+        $r   = '';
+        $sql = preg_replace_callback("~{$d[0]}([^{$d[0]}]*){$d[0]}~", static fn ($s) => str_replace($o, $r, "{$d[0]}{$s[1]}{$d[0]}"), $sql);
+        $sql = preg_replace_callback("~{$d[1]}([^{$d[1]}]*){$d[1]}~", static fn ($s) => str_replace($o, $r, "{$d[1]}{$s[1]}{$d[1]}"), $sql);
+        $sql = preg_replace_callback("~{$d[2]}([^{$d[2]}]*){$d[2]}~", static fn ($s) => str_replace($o, $r, "{$d[2]}{$s[1]}{$d[2]}"), $sql);
+        $sql = preg_replace("/[\n\r]/", ' ', $sql);
+
+        // pull out main select fields
+        preg_match('/select(.*?) from /is', $sql, $matches);
+
+        $sql = $matches[1];
+
+        $columnsStrings = explode(',', $sql);
+
+        $newColumns = [];
+
+        foreach ($columnsStrings as $string) {
+            $words = preg_replace('/\.+/', ' ', $string);
+            $words = explode(' ', trim($words));
+            $word  = trim(str_replace('$', ' ', trim(end($words))));
+            $word  = trim(str_replace($d, '', $word));
+
+            $newColumns[] = $word;
+        }
+
+        return $newColumns;
     }
 
     /**
@@ -1969,12 +2130,30 @@ class BaseBuilder
     /**
      * Compiles batch insert strings and runs the queries
      *
+     * @param array|BaseBuilder|object|string|null $set a dataset or select query
+     *
      * @throws DatabaseException
      *
      * @return false|int|string[] Number of rows inserted or FALSE on failure, SQL array when testMode
      */
-    public function insertBatch(?array $set = null, ?bool $escape = null, int $batchSize = 100)
+    public function insertBatch($set = null, ?bool $escape = null, int $batchSize = 100)
     {
+        $this->fromQuery($set);
+
+        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+            $sql = $this->_upsertBatch($this->QBFrom[0], $this->QBKeys, []);
+
+            if ($sql === '') {
+                return false; // @codeCoverageIgnore
+            }
+
+            $this->db->query($sql, null, false);
+
+            $this->resetWrite();
+
+            return $this->testMode ? $sql : $this->db->affectedRows();
+        }
+
         if ($set !== null) {
             $this->setBatch($set, $escape);
         }
@@ -1987,8 +2166,23 @@ class BaseBuilder
      */
     protected function _insertBatch(string $table, array $keys, array $values): string
     {
-        return 'INSERT ' . $this->compileIgnore('insert') . 'INTO ' . $table
-            . ' (' . implode(', ', $keys) . ') VALUES ' . implode(', ', $this->getValues($values));
+        $sql = $this->QBOptions['sql'] ?? ''; // @phpstan-ignore-line
+
+        // if this is the first iteration of batch then we need to build skeleton sql
+        if ($sql === '') {
+            $sql = 'INSERT ' . $this->compileIgnore('insert') . 'INTO ' . $table
+                . ' (' . implode(', ', $keys) . ")\n%s";
+
+            $this->QBOptions['sql'] = $sql;
+        }
+
+        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+            $data = $this->QBOptions['fromQuery'];
+        } else {
+            $data = 'VALUES ' . implode(', ', $this->getValues($values));
+        }
+
+        return sprintf($sql, $data);
     }
 
     /**
@@ -2288,144 +2482,114 @@ class BaseBuilder
     /**
      * Compiles an update string and runs the query
      *
-     * @param array|string|null $constraint
+     * @param array|BaseBuilder|object|string|null $set        a dataset or select query
+     * @param array|string|null                    $constraint
      *
      * @throws DatabaseException
      *
      * @return false|int|string[] Number of rows affected or FALSE on failure, SQL array when testMode
      */
-    public function updateBatch(?array $set = null, $constraint = null, int $batchSize = 100)
+    public function updateBatch($set = null, $constraint = null, int $batchSize = 100)
     {
+        $this->fromQuery($set);
+
+        $this->onConstraint($constraint);
+
+        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+            $sql = $this->_updateBatch($this->QBFrom[0], $this->QBKeys, []);
+
+            if ($sql === '') {
+                return false; // @codeCoverageIgnore
+            }
+
+            $this->db->query($sql, null, false);
+
+            $this->resetWrite();
+
+            return $this->testMode ? $sql : $this->db->affectedRows();
+        }
+
         if ($set !== null) {
             $this->setBatch($set, true);
         }
 
-        $this->onConstraint($constraint);
-
-        $this->batchExecute('_updateBatch', $batchSize);
-    }
-
-    /**
-     * Compiles an update string and runs the query
-     *
-     * @throws DatabaseException
-     *
-     * @return false|int|string[] Number of rows affected or FALSE on failure, SQL array when testMode
-     */
-    public function updateBatchOld(?array $set = null, ?string $index = null, int $batchSize = 100)
-    {
-        if ($index === null) {
-            if ($this->db->DBDebug) {
-                throw new DatabaseException('You must specify an index to match on for batch updates.');
-            }
-
-            return false; // @codeCoverageIgnore
-        }
-
-        if ($set === null) {
-            if (empty($this->QBSet)) {
-                if ($this->db->DBDebug) {
-                    throw new DatabaseException('You must use the "set" method to update an entry.');
-                }
-
-                return false; // @codeCoverageIgnore
-            }
-        } elseif (empty($set)) {
-            if ($this->db->DBDebug) {
-                throw new DatabaseException('updateBatch() called with no data');
-            }
-
-            return false; // @codeCoverageIgnore
-        }
-
-        $hasQBSet = $set === null;
-
-        $table = $this->QBFrom[0];
-
-        $affectedRows = 0;
-        $savedSQL     = [];
-        $savedQBWhere = $this->QBWhere;
-
-        if ($hasQBSet) {
-            $set = $this->QBSet;
-        }
-
-        for ($i = 0, $total = count($set); $i < $total; $i += $batchSize) {
-            if ($hasQBSet) {
-                $QBSet = array_slice($this->QBSet, $i, $batchSize);
-            } else {
-                $this->setUpdateBatch(array_slice($set, $i, $batchSize), $index);
-                $QBSet = $this->QBSet;
-            }
-
-            $sql = $this->_updateBatch(
-                $table,
-                $QBSet,
-                $this->db->protectIdentifiers($index)
-            );
-
-            if ($this->testMode) {
-                $savedSQL[] = $sql;
-            } else {
-                $this->db->query($sql, $this->binds, false);
-                $affectedRows += $this->db->affectedRows();
-            }
-
-            if (! $hasQBSet) {
-                $this->resetWrite();
-            }
-
-            $this->QBWhere = $savedQBWhere;
-        }
-
-        $this->resetWrite();
-
-        return $this->testMode ? $savedSQL : $affectedRows;
+        return $this->batchExecute('_updateBatch', $batchSize);
     }
 
     /**
      * Generates a platform-specific batch update string from the supplied data
      */
-    protected function _updateBatch(string $table, array $values, array $constraint): string
+    protected function _updateBatch(string $table, array $keys, array $values): string
     {
-        $keys = array_keys(current($values));
+        $sql = $this->QBOptions['sql'] ?? ''; // @phpstan-ignore-line
 
-        // make array for future use with composite keys - `field`
-        // future: $this->QBOptions['constraints']
-        $constraints = $constraint;
+        // if this is the first iteration of batch then we need to build skeleton sql
+        if ($sql === '') {
+            $constraints = $this->QBOptions['constraints'] ?? [];
 
-        // future: $this->QBOptions['updateFields']
-        $updateFields = array_filter($keys, static fn ($index) => ! in_array($index, $constraints, true));
+            if ($constraints === []) {
+                if ($this->db->DBDebug) {
+                    throw new DatabaseException('You must specify a constraint to match on for batch updates.');
+                }
 
-        $sql = 'UPDATE ' . $this->compileIgnore('update') . $table . "\n";
+                return ''; // @codeCoverageIgnor
+            }
 
-        $sql .= 'SET' . "\n";
+            $updateFields = $this->QBOptions['updateFields'] ??
+                $this->updateFields($keys, false, $constraints)->QBOptions['updateFields'] ??
+                [];
 
-        $sql .= implode(
-            ",\n",
-            array_map(static fn ($key) => $key . ' = u.' . $key, $updateFields)
-        ) . "\n";
+            $alias = $this->QBOptions['alias'] ?? '_u'; // @phpstan-ignore-line
 
-        $sql .= 'FROM (' . "\n";
+            $sql = 'UPDATE ' . $this->compileIgnore('update') . $table . "\n";
 
-        $sql .= implode(
-            " UNION ALL\n",
-            array_map(
-                static fn ($value) => 'SELECT ' . implode(', ', array_map(
-                    static fn ($key, $index) => $index . ' ' . $key,
-                    $keys,
-                    $value
-                )),
-                $values
-            )
-        ) . "\n";
+            $sql .= 'SET' . "\n";
 
-        $sql .= ') u' . "\n";
+            $sql .= implode(
+                ",\n",
+                array_map(
+                    static fn ($key, $value) => $key . ($value instanceof RawSql ?
+                        ' = ' . $value :
+                        ' = ' . $alias . '.' . $value),
+                    array_keys($updateFields),
+                    $updateFields
+                )
+            ) . "\n";
 
-        return $sql .= 'WHERE ' . implode(
-            ' AND ',
-            array_map(static fn ($key) => $table . '.' . $key . ' = u.' . $key, $constraints)
-        );
+            $sql .= 'FROM (' . "\n%s";
+
+            $sql .= ') ' . $alias . "\n";
+
+            $sql .= 'WHERE ' . implode(
+                ' AND ',
+                array_map(
+                    static fn ($key) => ($key instanceof RawSql ?
+                    $key :
+                    $table . '.' . $key . ' = ' . $alias . '.' . $key),
+                    $constraints
+                )
+            );
+
+            $this->QBOptions['sql'] = $sql;
+        }
+
+        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+            $data = $this->QBOptions['fromQuery'];
+        } else {
+            $data = implode(
+                " UNION ALL\n",
+                array_map(
+                    static fn ($value) => 'SELECT ' . implode(', ', array_map(
+                        static fn ($key, $index) => $index . ' ' . $key,
+                        $keys,
+                        $value
+                    )),
+                    $values
+                )
+            ) . "\n";
+        }
+
+        return sprintf($sql, $data);
     }
 
     /**
@@ -2435,39 +2599,15 @@ class BaseBuilder
      *
      * @throws DatabaseException
      *
-     * @return $this|null
+     * @return $this
      */
     public function setUpdateBatch($key, string $index = '', ?bool $escape = null)
     {
-        $key = $this->batchObjectToArray($key);
-
-        if (! is_array($key)) {
-            return null;
+        if ($index !== '') {
+            $this->onConstraint($index);
         }
 
-        if (! is_bool($escape)) {
-            $escape = $this->db->protectIdentifiers;
-        }
-
-        foreach ($key as $v) {
-            $indexSet = false;
-            $clean    = [];
-
-            foreach ($v as $k2 => $v2) {
-                if ($k2 === $index) {
-                    $indexSet = true;
-                }
-
-                $clean[$this->db->protectIdentifiers($k2, false)]
-                    = $escape ? $this->db->escape($v2) : $v2;
-            }
-
-            if ($indexSet === false) {
-                throw new DatabaseException('One or more rows submitted for batch updating is missing the specified index.');
-            }
-
-            $this->QBSet[] = $clean;
-        }
+        $this->setBatch($key, $escape);
 
         return $this;
     }
@@ -2909,7 +3049,7 @@ class BaseBuilder
     /**
      * Takes an object as input and converts the class variables to array key/vals
      *
-     * @param object $object
+     * @param array|object $object
      *
      * @return array
      */

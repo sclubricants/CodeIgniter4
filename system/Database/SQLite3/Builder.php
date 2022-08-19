@@ -13,6 +13,7 @@ namespace CodeIgniter\Database\SQLite3;
 
 use CodeIgniter\Database\BaseBuilder;
 use CodeIgniter\Database\Exceptions\DatabaseException;
+use CodeIgniter\Database\RawSql;
 
 /**
  * Builder for SQLite3
@@ -79,66 +80,90 @@ class Builder extends BaseBuilder
      */
     protected function _upsertBatch(string $table, array $keys, array $values): string
     {
-        $fieldNames = array_map(static fn ($columnName) => trim($columnName, '`'), $keys);
+        $sql = $this->QBOptions['sql'] ?? ''; // @phpstan-ignore-line
 
-        $constraints = $this->QBOptions['constraints'] ?? [];
+        // if this is the first iteration of batch then we need to build skeleton sql
+        if ($sql === '') {
+            $constraints = $this->QBOptions['constraints'] ?? [];
 
-        $updateFields = $this->QBOptions['updateFields'] ?? $fieldNames;
+            if (empty($constraints)) {
+                $fieldNames = array_map(static fn ($columnName) => trim($columnName, '`'), $keys);
 
-        if (empty($constraints)) {
-            $allIndexes = array_filter($this->db->getIndexData($table), static function ($index) use ($fieldNames) {
-                $hasAllFields = count(array_intersect($index->fields, $fieldNames)) === count($index->fields);
+                $allIndexes = array_filter($this->db->getIndexData($table), static function ($index) use ($fieldNames) {
+                    $hasAllFields = count(array_intersect($index->fields, $fieldNames)) === count($index->fields);
 
-                return ($index->type === 'PRIMARY' || $index->type === 'UNIQUE') && $hasAllFields;
-            });
+                    return ($index->type === 'PRIMARY' || $index->type === 'UNIQUE') && $hasAllFields;
+                });
 
-            foreach (array_map(static fn ($index) => $index->fields, $allIndexes) as $index) {
-                foreach ($index as $constraint) {
-                    $constraints[] = $constraint;
+                foreach (array_map(static fn ($index) => $index->fields, $allIndexes) as $index) {
+                    $constraints[] = current($index);
+                    break;
                 }
 
-                break;
+                $constraints = $this->onConstraint($constraints)->QBOptions['constraints'] ?? [];
             }
 
-            $this->QBOptions['constraints'] = $constraints;
-        }
+            if (empty($constraints)) {
+                if ($this->db->DBDebug) {
+                    throw new DatabaseException('No constraint found for upsert.');
+                }
 
-        if (empty($constraints)) {
-            if ($this->db->DBDebug) {
-                throw new DatabaseException('No constraint found for upsert.');
+                return ''; // @codeCoverageIgnore
             }
 
-            return ''; // @codeCoverageIgnore
+            $updateFields = $this->QBOptions['updateFields'] ??
+                $this->updateFields($keys, false, $constraints)->QBOptions['updateFields'] ??
+                [];
+
+            $sql = 'INSERT INTO ' . $table . ' (';
+
+            $sql .= implode(', ', array_map(static fn ($columnName) => $columnName, $keys));
+
+            $sql .= ")\n";
+
+            $sql .= '%s';
+
+            $sql .= 'ON CONFLICT(' . implode(',', $constraints) . ")\n";
+
+            $sql .= "DO UPDATE SET\n";
+
+            $sql .= implode(
+                ",\n",
+                array_map(
+                    static fn ($key, $value) => $key . ($value instanceof RawSql ?
+                        ' = ' . $value :
+                        ' = ' . '`excluded`.' . $value),
+                    array_keys($updateFields),
+                    $updateFields
+                )
+            );
+
+            $this->QBOptions['sql'] = $sql;
         }
 
-        $sql = 'INSERT INTO ' . $table . ' (';
+        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+            $hasWhere = stripos($this->QBOptions['fromQuery'], 'WHERE') > 0;
 
-        $sql .= implode(', ', array_map(static fn ($columnName) => $columnName, $keys));
+            $data = $this->QBOptions['fromQuery'] . ($hasWhere ? '' : "\nWHERE 1 = 1\n");
+        } else {
+            $data = 'VALUES ' . implode(', ', $this->getValues($values)) . "\n";
+        }
 
-        $sql .= ")\n";
-
-        $sql .= 'VALUES ' . implode(', ', $this->getValues($values)) . "\n";
-
-        $sql .= 'ON CONFLICT(`' . implode('`,`', $constraints) . "`)\n";
-
-        $sql .= "DO UPDATE SET\n";
-
-        return $sql . implode(
-            ",\n",
-            array_map(
-                static fn ($updateField) => '`' . $updateField . '` = `excluded`.`' . $updateField . '`',
-                $updateFields
-            )
-        );
+        return sprintf($sql, $data);
+    }
 
     /**
      * Generates a platform-specific batch update string from the supplied data
      */
-    protected function _updateBatch(string $table, array $values, string $index): string
+    protected function _updateBatch(string $table, array $keys, array $values): string
     {
         if (version_compare($this->db->getVersion(), '3.33.0') >= 0) {
-            return parent::_updateBatch($table, $values, $index);
+            return parent::_updateBatch($table, $keys, $values);
         }
+
+        $constraints = $this->QBOptions['constraints'] ?? [];
+
+        $index = current($constraints);
 
         $ids   = [];
         $final = [];

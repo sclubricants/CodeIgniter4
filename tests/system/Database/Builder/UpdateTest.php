@@ -234,13 +234,13 @@ final class UpdateTest extends CIUnitTestCase
         $expected = <<<'EOF'
             UPDATE "jobs"
             SET
-            "name" = u."name",
-            "description" = u."description"
+            "description" = _u."description",
+            "name" = _u."name"
             FROM (
-            SELECT 2 "id", 'Comedian' "name", 'There''s something in your teeth' "description" UNION ALL
-            SELECT 3 "id", 'Cab Driver' "name", 'I am yellow' "description"
-            ) u
-            WHERE "jobs"."id" = u."id"
+            SELECT 'There''s something in your teeth' "description", 2 "id", 'Comedian' "name" UNION ALL
+            SELECT 'I am yellow' "description", 3 "id", 'Cab Driver' "name"
+            ) _u
+            WHERE "jobs"."id" = _u."id"
             EOF;
 
         $this->assertSame($expected, $query->getQuery());
@@ -273,13 +273,13 @@ final class UpdateTest extends CIUnitTestCase
         $expected = <<<'EOF'
             UPDATE "jobs"
             SET
-            "name" = u."name",
-            "description" = u."description"
+            "description" = _u."description",
+            "name" = _u."name"
             FROM (
-            SELECT 2 "id", SUBSTRING(name, 1) "name", SUBSTRING(description, 3) "description" UNION ALL
-            SELECT 3 "id", SUBSTRING(name, 2) "name", SUBSTRING(description, 4) "description"
-            ) u
-            WHERE "jobs"."id" = u."id"
+            SELECT SUBSTRING(description, 3) "description", 2 "id", SUBSTRING(name, 1) "name" UNION ALL
+            SELECT SUBSTRING(description, 4) "description", 3 "id", SUBSTRING(name, 2) "name"
+            ) _u
+            WHERE "jobs"."id" = _u."id"
             EOF;
 
         $this->assertSame($expected, $query->getQuery());
@@ -290,7 +290,7 @@ final class UpdateTest extends CIUnitTestCase
         $builder = new BaseBuilder('jobs', $this->db);
 
         $this->expectException(DatabaseException::class);
-        $this->expectExceptionMessage('You must use the "set" method to update an entry.');
+        $this->expectExceptionMessage('No data availble to process.');
 
         $builder->updateBatch(null, 'id');
     }
@@ -300,7 +300,7 @@ final class UpdateTest extends CIUnitTestCase
         $builder = new BaseBuilder('jobs', $this->db);
 
         $this->expectException(DatabaseException::class);
-        $this->expectExceptionMessage('You must specify an index to match on for batch updates.');
+        $this->expectExceptionMessage('setBatch() has no data.');
 
         $builder->updateBatch([]);
     }
@@ -310,7 +310,7 @@ final class UpdateTest extends CIUnitTestCase
         $builder = new BaseBuilder('jobs', $this->db);
 
         $this->expectException(DatabaseException::class);
-        $this->expectExceptionMessage('updateBatch() called with no data');
+        $this->expectExceptionMessage('setBatch() has no data.');
 
         $builder->updateBatch([], 'id');
     }

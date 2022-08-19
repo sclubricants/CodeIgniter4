@@ -12,6 +12,8 @@
 namespace CodeIgniter\Database\MySQLi;
 
 use CodeIgniter\Database\BaseBuilder;
+use CodeIgniter\Database\Exceptions\DatabaseException;
+use CodeIgniter\Database\RawSql;
 
 /**
  * Builder for MySQLi
@@ -59,52 +61,74 @@ class Builder extends BaseBuilder
      */
     protected function _updateBatch(string $table, array $keys, array $values): string
     {
-        $constraints = $this->QBOptions['constraints'] ?? [];
+        $sql = $this->QBOptions['sql'] ?? ''; // @phpstan-ignore-line
 
-        if ($constraints === []) {
-            if ($this->db->DBDebug) {
-                throw new DatabaseException('You must specify a constraint to match on for batch updates.');
+        // if this is the first iteration of batch then we need to build skeleton sql
+        if ($sql === '') {
+            $constraints = $this->QBOptions['constraints'] ?? [];
+
+            if ($constraints === []) {
+                if ($this->db->DBDebug) {
+                    throw new DatabaseException('You must specify a constraint to match on for batch updates.');
+                }
+
+                return ''; // @codeCoverageIgnor
             }
 
-            return ''; // @codeCoverageIgnor
+            $updateFields = $this->QBOptions['updateFields'] ??
+                $this->updateFields($keys, false, $constraints)->QBOptions['updateFields'] ??
+                [];
+
+            $alias = $this->QBOptions['alias'] ?? '`_u`'; // @phpstan-ignore-line
+
+            $sql = 'UPDATE ' . $this->compileIgnore('update') . $table . "\n";
+
+            $sql .= 'INNER JOIN (' . "\n%s";
+
+            $sql .= ') ' . $alias . "\n";
+
+            $sql .= 'ON ' . implode(
+                ' AND ',
+                array_map(
+                    static fn ($key) => ($key instanceof RawSql ?
+                    $key :
+                    $table . '.' . $key . ' = ' . $alias . '.' . $key),
+                    $constraints
+                )
+            ) . "\n";
+
+            $sql .= 'SET' . "\n";
+
+            $sql .= implode(
+                ",\n",
+                array_map(
+                    static fn ($key, $value) => $table . '.' . $key . ($value instanceof RawSql ?
+                        ' = ' . $value :
+                        ' = ' . $alias . '.' . $value),
+                    array_keys($updateFields),
+                    $updateFields
+                )
+            );
+
+            $this->QBOptions['sql'] = $sql;
         }
 
-        $updateFields = $this->QBOptions['updateFields'] ?? [];
-
-        if ($updateFields === []) {
-            $updateFields = array_filter($keys, static fn ($index) => ! in_array($index, $constraints, true));
-            
-            $this->QBOptions['updateFields'] = $updateFields;
+        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+            $data = $this->QBOptions['fromQuery'];
+        } else {
+            $data = implode(
+                " UNION ALL\n",
+                array_map(
+                    static fn ($value) => 'SELECT ' . implode(', ', array_map(
+                        static fn ($key, $index) => $index . ' ' . $key,
+                        $keys,
+                        $value
+                    )),
+                    $values
+                )
+            ) . "\n";
         }
 
-        $sql = 'UPDATE ' . $this->compileIgnore('update') . $table . " AS t\n";
-
-        $sql .= 'INNER JOIN (' . "\n";
-
-        $sql .= implode(
-            " UNION ALL\n",
-            array_map(
-                static fn ($value) => 'SELECT ' . implode(', ', array_map(
-                    static fn ($key, $index) => $index . ' ' . $key,
-                    $keys,
-                    $value
-                )),
-                $values
-            )
-        ) . "\n";
-
-        $sql .= ') u' . "\n";
-
-        $sql .= 'ON ' . implode(
-            ' AND ',
-            array_map(static fn ($key) => 't.' . $key . ' = u.' . $key, $constraints)
-        ) . "\n";
-
-        $sql .= 'SET' . "\n";
-
-        return $sql .= implode(
-            ",\n",
-            array_map(static fn ($key) => 't.' . $key . ' = u.' . $key, $updateFields)
-        );
+        return sprintf($sql, $data);
     }
 }

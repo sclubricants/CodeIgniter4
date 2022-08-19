@@ -148,12 +148,17 @@ final class InsertTest extends CIUnitTestCase
         $this->assertInstanceOf(Query::class, $query);
 
         $raw = <<<'SQL'
-            INSERT INTO "jobs" ("description", "id", "name") VALUES ('There''s something in your teeth',2,'Commedian'), ('I am yellow',3,'Cab Driver')
+            INSERT INTO "jobs" ("description", "id", "name")
+            VALUES ('There''s something in your teeth',2,'Commedian'), ('I am yellow',3,'Cab Driver')
             SQL;
-        $this->assertSame($raw, str_replace("\n", ' ', $query->getOriginalQuery()));
+        $this->assertSame($raw, $query->getOriginalQuery());
 
-        $expected = "INSERT INTO \"jobs\" (\"description\", \"id\", \"name\") VALUES ('There''s something in your teeth',2,'Commedian'), ('I am yellow',3,'Cab Driver')";
-        $this->assertSame($expected, str_replace("\n", ' ', $query->getQuery()));
+        $expected = <<<'SQL'
+            INSERT INTO "jobs" ("description", "id", "name")
+            VALUES ('There''s something in your teeth',2,'Commedian'), ('I am yellow',3,'Cab Driver')
+            SQL;
+
+        $this->assertSame($expected, $query->getQuery());
     }
 
     /**
@@ -249,7 +254,7 @@ final class InsertTest extends CIUnitTestCase
         $builder = $this->db->table('jobs');
 
         $this->expectException(DatabaseException::class);
-        $this->expectExceptionMessage('You must use the "set" method to update an entry.');
+        $this->expectExceptionMessage('No data availble to process.');
         $builder->insertBatch();
     }
 
@@ -258,7 +263,7 @@ final class InsertTest extends CIUnitTestCase
         $builder = $this->db->table('jobs');
 
         $this->expectException(DatabaseException::class);
-        $this->expectExceptionMessage('insertBatch()/upsertBatch called with no data');
+        $this->expectExceptionMessage('setBatch() has no data.');
         $builder->insertBatch([]);
     }
 }
