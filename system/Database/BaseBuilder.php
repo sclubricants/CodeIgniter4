@@ -157,7 +157,15 @@ class BaseBuilder
      * QB Options data
      * Holds additional data used to render SQL
      *
-     * @phpstan-var array{updateFields?: array, constraints?: array, tableIdentity?: string}
+     * @phpstan-var array{
+     * updateFields?: array,
+     * constraints?: array,
+     * tableIdentity?: string,
+     * fromQuery?: string,
+     * sql?: string,
+     * updateFieldsAdditional?: array,
+     * alias?: string
+     * }
      *
      * @var array
      */
@@ -1904,7 +1912,7 @@ class BaseBuilder
     {
         $this->fromQuery($set);
 
-        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+        if (isset($this->QBOptions['fromQuery'])) {
             $sql = $this->_upsertBatch($this->QBFrom[0], $this->QBKeys, []);
 
             if ($sql === '') {
@@ -1930,7 +1938,7 @@ class BaseBuilder
      */
     protected function _upsertBatch(string $table, array $keys, array $values): string
     {
-        $sql = $this->QBOptions['sql'] ?? ''; // @phpstan-ignore-line
+        $sql = $this->QBOptions['sql'] ?? '';
 
         // if this is the first iteration of batch then we need to build skeleton sql
         if ($sql === '') {
@@ -1956,7 +1964,7 @@ class BaseBuilder
             $this->QBOptions['sql'] = $sql;
         }
 
-        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+        if (isset($this->QBOptions['fromQuery'])) {
             $data = $this->QBOptions['fromQuery'];
         } else {
             $data = 'VALUES ' . implode(', ', $this->getValues($values)) . "\n";
@@ -2031,8 +2039,8 @@ class BaseBuilder
                 }
             }
 
-            if ($addToDefault === false && isset($this->QBOptions['updateFieldsAdditional'])) { // @phpstan-ignore-line
-                $this->QBOptions['updateFields'] = array_merge($this->QBOptions['updateFields'], $this->QBOptions['updateFieldsAdditional'] ?? []); // @phpstan-ignore-line
+            if ($addToDefault === false && isset($this->QBOptions['updateFieldsAdditional']) && isset($this->QBOptions['updateFields'])) {
+                $this->QBOptions['updateFields'] = array_merge($this->QBOptions['updateFields'], $this->QBOptions['updateFieldsAdditional']);
 
                 unset($this->QBOptions['updateFieldsAdditional']);
             }
@@ -2140,7 +2148,7 @@ class BaseBuilder
     {
         $this->fromQuery($set);
 
-        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+        if (isset($this->QBOptions['fromQuery'])) {
             $sql = $this->_upsertBatch($this->QBFrom[0], $this->QBKeys, []);
 
             if ($sql === '') {
@@ -2166,7 +2174,7 @@ class BaseBuilder
      */
     protected function _insertBatch(string $table, array $keys, array $values): string
     {
-        $sql = $this->QBOptions['sql'] ?? ''; // @phpstan-ignore-line
+        $sql = $this->QBOptions['sql'] ?? '';
 
         // if this is the first iteration of batch then we need to build skeleton sql
         if ($sql === '') {
@@ -2176,7 +2184,7 @@ class BaseBuilder
             $this->QBOptions['sql'] = $sql;
         }
 
-        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+        if (isset($this->QBOptions['fromQuery'])) {
             $data = $this->QBOptions['fromQuery'];
         } else {
             $data = 'VALUES ' . implode(', ', $this->getValues($values));
@@ -2495,7 +2503,7 @@ class BaseBuilder
 
         $this->onConstraint($constraint);
 
-        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+        if (isset($this->QBOptions['fromQuery'])) {
             $sql = $this->_updateBatch($this->QBFrom[0], $this->QBKeys, []);
 
             if ($sql === '') {
@@ -2521,7 +2529,7 @@ class BaseBuilder
      */
     protected function _updateBatch(string $table, array $keys, array $values): string
     {
-        $sql = $this->QBOptions['sql'] ?? ''; // @phpstan-ignore-line
+        $sql = $this->QBOptions['sql'] ?? '';
 
         // if this is the first iteration of batch then we need to build skeleton sql
         if ($sql === '') {
@@ -2539,7 +2547,7 @@ class BaseBuilder
                 $this->updateFields($keys, false, $constraints)->QBOptions['updateFields'] ??
                 [];
 
-            $alias = $this->QBOptions['alias'] ?? '_u'; // @phpstan-ignore-line
+            $alias = $this->QBOptions['alias'] ?? '_u';
 
             $sql = 'UPDATE ' . $this->compileIgnore('update') . $table . "\n";
 
@@ -2573,7 +2581,7 @@ class BaseBuilder
             $this->QBOptions['sql'] = $sql;
         }
 
-        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+        if (isset($this->QBOptions['fromQuery'])) {
             $data = $this->QBOptions['fromQuery'];
         } else {
             $data = implode(

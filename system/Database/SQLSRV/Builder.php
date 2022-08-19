@@ -180,7 +180,7 @@ class Builder extends BaseBuilder
      */
     protected function _insertBatch(string $table, array $keys, array $values): string
     {
-        $sql = $this->QBOptions['sql'] ?? ''; // @phpstan-ignore-line
+        $sql = $this->QBOptions['sql'] ?? '';
 
         // if this is the first iteration of batch then we need to build skeleton sql
         if ($sql === '') {
@@ -190,7 +190,7 @@ class Builder extends BaseBuilder
             $this->QBOptions['sql'] = $sql;
         }
 
-        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+        if (isset($this->QBOptions['fromQuery'])) {
             $data = $this->QBOptions['fromQuery'];
         } else {
             $data = 'VALUES ' . implode(', ', $this->getValues($values));
@@ -206,7 +206,7 @@ class Builder extends BaseBuilder
      */
     protected function _upsertBatch(string $table, array $keys, array $values): string
     {
-        $sql = $this->QBOptions['sql'] ?? ''; // @phpstan-ignore-line
+        $sql = $this->QBOptions['sql'] ?? '';
 
         // if this is the first iteration of batch then we need to build skeleton sql
         if ($sql === '') {
@@ -338,7 +338,7 @@ class Builder extends BaseBuilder
             $this->QBOptions['sql'] = $sql;
         }
 
-        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+        if (isset($this->QBOptions['fromQuery'])) {
             $data = $this->QBOptions['fromQuery'];
         } else {
             $data = 'VALUES ' . implode(', ', $this->getValues($values)) . "\n";

@@ -61,7 +61,7 @@ class Builder extends BaseBuilder
      */
     protected function _updateBatch(string $table, array $keys, array $values): string
     {
-        $sql = $this->QBOptions['sql'] ?? ''; // @phpstan-ignore-line
+        $sql = $this->QBOptions['sql'] ?? '';
 
         // if this is the first iteration of batch then we need to build skeleton sql
         if ($sql === '') {
@@ -79,7 +79,7 @@ class Builder extends BaseBuilder
                 $this->updateFields($keys, false, $constraints)->QBOptions['updateFields'] ??
                 [];
 
-            $alias = $this->QBOptions['alias'] ?? '`_u`'; // @phpstan-ignore-line
+            $alias = $this->QBOptions['alias'] ?? '`_u`';
 
             $sql = 'UPDATE ' . $this->compileIgnore('update') . $table . "\n";
 
@@ -113,7 +113,7 @@ class Builder extends BaseBuilder
             $this->QBOptions['sql'] = $sql;
         }
 
-        if (isset($this->QBOptions['fromQuery'])) { // @phpstan-ignore-line
+        if (isset($this->QBOptions['fromQuery'])) {
             $data = $this->QBOptions['fromQuery'];
         } else {
             $data = implode(
