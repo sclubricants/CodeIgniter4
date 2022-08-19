@@ -26,11 +26,12 @@ use Tests\Support\Database\Seeds\CITestSeeder;
  */
 final class SclubricantsTest extends CIUnitTestCase
 {
+    use DatabaseTestTrait;
+
     /**
      * @var Forge|mixed
      */
     public $forge;
-    use DatabaseTestTrait;
 
     protected $refresh = true;
     protected $seed    = CITestSeeder::class;
