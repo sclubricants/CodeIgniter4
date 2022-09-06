@@ -94,6 +94,10 @@ class Migration_Create_test_tables extends Migration
             );
         }
 
+        if ($this->db->DBDriver === 'PDO_ODBC') {
+            unset($data_type_fields['type_set']);
+        }
+
         $this->forge->addField($data_type_fields)->addKey('id', true)->createTable('type_test', true);
 
         // Empty Table

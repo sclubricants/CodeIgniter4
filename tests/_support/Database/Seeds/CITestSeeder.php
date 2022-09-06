@@ -176,6 +176,15 @@ class CITestSeeder extends Seeder
             unset($data['type_test'][0]['type_blob']);
         }
 
+        if ($this->db->DBDriver === 'PDO_ODBC') {
+            $data['type_test'][0]['type_date']     = '2020-01-11';
+            $data['type_test'][0]['type_time']     = '15:22:00.000';
+            $data['type_test'][0]['type_datetime'] = '2020-06-18 05:12:24.000';
+
+            unset($data['type_test'][0]['type_set'], $data['type_test'][0]['type_timestamp'], $data['type_test'][0]['type_blob']);
+
+        }
+
         foreach ($data as $table => $dummy_data) {
             $this->db->table($table)->truncate();
 

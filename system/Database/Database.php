@@ -129,7 +129,11 @@ class Database
      */
     protected function initDriver(string $driver, string $class, $argument): object
     {
-        $class = $driver . '\\' . $class;
+        if (strpos($driver, '_') !== false) {
+            $class = str_replace('_', '\\', $driver) . "\\{$class}";
+        } else {
+            $class = $driver . '\\' . $class;
+        }
 
         if (strpos($driver, '\\') === false) {
             $class = "CodeIgniter\\Database\\{$class}";
