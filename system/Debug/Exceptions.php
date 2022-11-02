@@ -114,10 +114,16 @@ class Exceptions
         [$statusCode, $exitCode] = $this->determineCodes($exception);
 
         if ($this->config->log === true && ! in_array($statusCode, $this->config->ignoreCodes, true)) {
+            if (is_cli()) {
+                $path = 'CLI ' . implode('/', array_slice($this->request->getServer('argv'), 1));
+            } else {
+                $path = $this->request->getServer('REQUEST_METHOD') . ' ' . $this->request->getPath();
+            }
+
             log_message('critical', "{message}\nin {exFile} on line {exLine}.\n{trace}", [
                 'message' => $exception->getMessage(),
                 'exFile'  => clean_path($exception->getFile()), // {file} refers to THIS file
-                'exLine'  => $exception->getLine(), // {line} refers to THIS line
+                'exLine'  => $exception->getLine() . "\nPATH: " . $path, // {line} refers to THIS line
                 'trace'   => self::renderBacktrace($exception->getTrace()),
             ]);
         }
